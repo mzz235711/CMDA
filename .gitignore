@@ -1,0 +1,30 @@
+# Local environments, generated results and credentials
+.venvs/
+.venv/
+.runtime_config/
+.aws/
+.codex/
+.agents/
+.env
+__pycache__/
+*.py[cod]
+*.o
+*.so
+*.pkl
+*.pt
+*.pth
+*.db
+results/
+logs/
+third_party/
+github_release/
+# Manuscripts and local revision material
+/*.pdf
+/*.zip
+/*.tex
+/*_CN.md
+/ICE_*/
+/figures/
+# Local-only timing workloads with placeholder optimizer-cost labels
+/BaoForPostgreSQL/bao_server/workloads/job/
+/BaoForPostgreSQL/bao_server/workloads/dsb/

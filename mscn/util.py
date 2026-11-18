@@ -1,5 +1,6 @@
 import numpy as np
 import psycopg2
+import torch
 
 def idx_to_onehot(idx, number):
     onehot = np.zeros(number, dtype=np.float32)
@@ -73,9 +74,14 @@ def normalize_labels(labels, min_val=None, max_val=None):
 
 
 def unnormalize_labels(labels_norm, min_val, max_val, cuda):
-    if cuda == 'cuda':
-        labels_norm = [l.cpu() for l in labels_norm]
-    labels_norm = np.array(labels_norm, dtype=np.float32)
+    normalized = []
+    for value in labels_norm:
+        if torch.is_tensor(value):
+            value = value.detach().cpu().reshape(-1).tolist()
+            normalized.extend(value)
+        else:
+            normalized.extend(np.asarray(value).reshape(-1).tolist())
+    labels_norm = np.asarray(normalized, dtype=np.float32)
     labels = (labels_norm * (max_val - min_val)) + min_val
     return np.array(np.round(np.exp(labels)), dtype=np.int64)
 
@@ -114,10 +120,10 @@ def query_encode_linear(samples, tables, predicates, joins, column_min_max_vals,
                 if norm_val > 1:
                     print("ERROR")
                 cid = column2vec[column]
-                if op is '=':
+                if op == '=':
                     enc[len(join2vec) + 2 * cid] = norm_val
                     enc[len(join2vec) + 2 * cid + 1] = norm_val
-                elif op is '<' or op is '<=':
+                elif op == '<' or op == '<=':
                     enc[len(join2vec) + 2 * cid + 1] = norm_val
                 else:
                     enc[len(join2vec) + 2 * cid] = norm_val

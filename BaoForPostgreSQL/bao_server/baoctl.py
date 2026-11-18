@@ -3,7 +3,15 @@ import socket
 import json
 import time
 import dataset
-import nni
+import os
+try:
+    import nni
+except Exception:
+    class _NniFallback:
+        @staticmethod
+        def get_next_parameter():
+            return {}
+    nni = _NniFallback()
 
 def __json_bytes(obj):
     return (json.dumps(obj) + "\n").encode("UTF-8")
@@ -25,10 +33,25 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, help="Dataset")
     parser.add_argument("--train_mode", type=str, default="train", help="train, adaptation or predict")
     parser.add_argument("--contrastive", action='store_true', help='use contrastive learning')
+    parser.add_argument("--template_contrastive", action="store_true",
+                        help="use query-template supervised contrastive learning")
+    parser.add_argument("--static_target_weight", type=float,
+                        help="fixed per-target weight; enables Static-Upweight")
+    parser.add_argument("--static_train_indices")
+    parser.add_argument("--static_validation_indices")
     parser.add_argument("--meta", action="store_true", help='use meta learning')
     parser.add_argument("--repeat", type=int, default=10, help='hyperparameter')
     parser.add_argument("--alpha", type=float, default=0.25, help='hyperparameter')
     parser.add_argument("--lr", type=float, default=0.001, help='hyperparameter')
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--adaptation_budget", type=int, default=10)
+    parser.add_argument("--output_root", default="../../results/cost_multiseed")
+    parser.add_argument("--method_name")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--prepare_selection_only", action="store_true")
+    parser.add_argument("--selection_indices",
+                        help="explicit comma-separated adaptation IDs selected by an external policy")
     parser.add_argument("--load",
                         metavar="PATH",
                         help="Load the saved Bao model")
@@ -55,6 +78,110 @@ if __name__ == "__main__":
     optimized_params = nni.get_next_parameter()
     params.update(optimized_params)
     print(params)
+
+    if args.seed is not None:
+        import cost_experiment
+        import train
+        config = dataset.load_multiseed_dataset(args.dataset)
+        output_root = os.path.abspath(args.output_root)
+        selection, selection_file = cost_experiment.load_or_create_selection(
+            output_root, args.dataset, args.adaptation_budget, args.seed,
+            config["adaptation_plans"], config["adaptation_labels"])
+        if args.selection_indices:
+            explicit = sorted(int(value) for value in args.selection_indices.split(",") if value)
+            pool_ids = set(train.load_aligned_experience(
+                config["adaptation_plans"], config["adaptation_labels"])[2])
+            if (len(explicit) != args.adaptation_budget or
+                    len(set(explicit)) != len(explicit) or
+                    not set(explicit).issubset(pool_ids)):
+                raise ValueError("Explicit selection must contain adaptation_budget unique pool IDs")
+            selection = {**selection, "adaptation_indices": explicit,
+                         "selection_id": cost_experiment.ids_hash(explicit),
+                         "selection_policy": "external"}
+            external_dir = os.path.join(output_root, args.dataset, "external_selections")
+            os.makedirs(external_dir, exist_ok=True)
+            selection_file = os.path.join(
+                external_dir, "{}_seed_{:03d}.json".format(
+                    args.method_name or "external", args.seed))
+            with open(selection_file, "w") as stream:
+                json.dump(selection, stream, indent=2, sort_keys=True)
+        full_adaptation_indices = selection["adaptation_indices"]
+        static_train_indices = ([int(x) for x in args.static_train_indices.split(",") if x]
+                                if args.static_train_indices else None)
+        static_validation_indices = ([int(x) for x in args.static_validation_indices.split(",") if x]
+                                     if args.static_validation_indices else None)
+        if static_train_indices is not None:
+            if args.static_target_weight is None or static_validation_indices is None:
+                raise ValueError("Static inner CV requires weight, train IDs, and validation IDs")
+            if (set(static_train_indices) | set(static_validation_indices) != set(full_adaptation_indices) or
+                    set(static_train_indices) & set(static_validation_indices)):
+                raise ValueError("Static CV IDs must partition adaptation IDs")
+            selection = {**selection, "adaptation_indices": static_train_indices}
+        evaluation_id, evaluation_alignment = cost_experiment.evaluation_identity(
+            config["evaluation_plans"], config["evaluation_labels"])
+        method_name = args.method_name or (
+            "cmda" if args.contrastive and args.meta else
+            "cmda_c" if args.contrastive else
+            "cmda_m" if args.meta else "adapt")
+        run_dir = os.path.join(
+            output_root, args.dataset,
+            "budget_{}".format(args.adaptation_budget), method_name,
+            "seed_{:03d}".format(args.seed))
+        os.makedirs(run_dir, exist_ok=True)
+        manifest = {
+            **selection,
+            "method": method_name,
+            "contrastive": args.contrastive,
+            "template_contrastive": args.template_contrastive,
+            "static_target_weight": args.static_target_weight,
+            "full_adaptation_indices": full_adaptation_indices,
+            "static_validation_indices": static_validation_indices,
+            "meta": args.meta,
+            "alpha": params["alpha"],
+            "learning_rate": params["lr"],
+            "repeat": params["repeat"],
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "selection_manifest": os.path.abspath(selection_file),
+            "evaluation_id": evaluation_id,
+            "evaluation_alignment": evaluation_alignment,
+        }
+        with open(os.path.join(run_dir, "manifest.json"), "w") as stream:
+            json.dump(manifest, stream, indent=2, sort_keys=True)
+        print("Adaptation query IDs:", selection["adaptation_indices"])
+        print("Selection ID:", selection["selection_id"])
+        print("Evaluation ID:", evaluation_id)
+        if args.prepare_selection_only:
+            raise SystemExit(0)
+        cost_experiment.set_global_seed(args.seed)
+        start_time = time.time()
+        _, alignments = train.train_and_save_model_from_file(
+            run_dir, config["train_plans"], config["adaptation_plans"],
+            config["train_labels"], config["adaptation_labels"],
+            contrastive=args.contrastive, meta=args.meta,
+            repeat=params["repeat"], alpha=params["alpha"], lr=params["lr"],
+            adaptation_indices=selection["adaptation_indices"],
+            epochs=args.epochs, batch_size=args.batch_size, seed=args.seed,
+            template_contrastive=args.template_contrastive,
+            train_sql_file=config["train_sql"],
+            adaptation_sql_file=config["adaptation_sql"],
+            static_target_weight=args.static_target_weight)
+        manifest["training_alignment"] = alignments
+        manifest["training_seconds"] = time.time() - start_time
+        with open(os.path.join(run_dir, "manifest.json"), "w") as stream:
+            json.dump(manifest, stream, indent=2, sort_keys=True)
+        prediction_plans = (config["adaptation_plans"] if static_validation_indices is not None
+                            else config["evaluation_plans"])
+        prediction_labels = (config["adaptation_labels"] if static_validation_indices is not None
+                             else config["evaluation_labels"])
+        train.predict(
+            run_dir, prediction_plans, prediction_labels,
+            alpha=params["alpha"], repeat=params["repeat"],
+            contrastive=args.contrastive, meta=args.meta, lr=params["lr"],
+            output_dir=run_dir,
+            template_contrastive=args.template_contrastive,
+            prediction_indices=static_validation_indices)
+        raise SystemExit(0)
 
     if args.dataset == "test":
         train_file, predict_file, save_folder, adaptation_file =  dataset.load_test_dataset()

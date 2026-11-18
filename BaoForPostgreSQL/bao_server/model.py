@@ -43,13 +43,63 @@ def ranking_loss(features, true_labels, est_labels, temperature=2):
     feature_similarity = torch.exp(feature_similarity / temperature)
     #label_similarity = 1 / ((true_labels.unsqueeze(1) - true_labels)**2 + 1)
     label_similarity = (true_labels - true_labels.squeeze(1))**2
-    loss = [] 
-    for i in range(bs):
-        mask = ((label_similarity[i] - label_similarity[i].unsqueeze(1)) >= 0).float()
-        loss.append(torch.sum(-torch.log(feature_similarity[i] / torch.sum(mask * feature_similarity[i], dim=1))).unsqueeze(0))
-    loss = torch.cat(loss)
-    loss /= bs
-    return loss
+    # The original denominator for candidate j contains all candidates whose
+    # output distance is at least d(i,j). Sorting once per anchor and taking a
+    # suffix sum is mathematically equivalent, but avoids the Python anchor
+    # loop and its repeated O(batch^2) masks.
+    sorted_distances, order = torch.sort(label_similarity, dim=1)
+    sorted_similarities = torch.gather(feature_similarity, 1, order)
+    if sorted_similarities.is_cuda and torch.are_deterministic_algorithms_enabled():
+        # CUDA cumsum has no deterministic implementation.  Multiplication by
+        # a lower-triangular matrix computes the same row-wise suffix sums and
+        # remains reproducible under CUBLAS_WORKSPACE_CONFIG.
+        suffix_matrix = torch.tril(torch.ones(
+            bs, bs, dtype=sorted_similarities.dtype,
+            device=sorted_similarities.device))
+        suffix_similarities = torch.mm(sorted_similarities, suffix_matrix)
+    else:
+        suffix_similarities = torch.flip(
+            torch.cumsum(torch.flip(sorted_similarities, dims=(1,)), dim=1),
+            dims=(1,))
+    lower_bounds = torch.searchsorted(
+        sorted_distances, label_similarity.contiguous(), right=False)
+    denominators = torch.gather(suffix_similarities, 1, lower_bounds)
+    return (-torch.log(feature_similarity / denominators)).sum(dim=1) / bs
+
+
+def template_contrastive_loss(features, template_labels, temperature=2.0):
+    normalized = torch.nn.functional.normalize(features, dim=1)
+    logits = torch.mm(normalized, normalized.transpose(0, 1)) / temperature
+    logits = logits - logits.max(dim=1, keepdim=True)[0].detach()
+    count = features.shape[0]
+    self_mask = ~torch.eye(count, dtype=torch.bool, device=features.device)
+    positives = template_labels.view(-1, 1).eq(template_labels.view(1, -1)) & self_mask
+    exp_logits = torch.exp(logits) * self_mask.float()
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
+    positive_count = positives.sum(dim=1)
+    losses = (-(log_prob * positives.float()).sum(dim=1) /
+              positive_count.clamp(min=1).float())
+    return torch.where(positive_count > 0, losses, torch.zeros_like(losses))
+
+
+def _broadcast_weighted_objective(weights, representation_loss,
+                                  regression_loss, alpha):
+    """Evaluate the historical broadcasted objective without a B x B tensor.
+
+    ``representation_loss`` and ``weights`` have shape [B], while Bao's
+    unreduced regression loss has shape [B, 1].  The original expression
+    therefore broadcasts to [B, B] before summation.  Expanding that sum
+    algebraically preserves both its value and gradients while avoiding the
+    quadratic temporary and autograd graph.
+    """
+    batch_size = regression_loss.shape[0]
+    regression_sum = regression_loss.sum()
+    if not torch.is_tensor(weights) or weights.ndim == 0:
+        return batch_size * weights * (
+            alpha * representation_loss.sum()
+            + (1 - alpha) * regression_sum)
+    return (alpha * batch_size * torch.sum(weights * representation_loss)
+            + (1 - alpha) * torch.sum(weights) * regression_sum)
 
 '''
 def ranking_loss(features, true_labels, est_labels, temperature=2):
@@ -81,17 +131,33 @@ def collate(x):
         trees.append(tree)
         targets.append(target)
 
-    targets = torch.tensor(targets)
+    targets = torch.from_numpy(np.asarray(targets, dtype=np.float32))
     return trees, targets
 
+
+def collate_template(x):
+    trees, targets, template_labels = zip(*x)
+    return (list(trees),
+            torch.from_numpy(np.asarray(targets, dtype=np.float32)),
+            torch.tensor(template_labels, dtype=torch.long))
+
+
+def collate_weighted(x):
+    trees, targets, weights = zip(*x)
+    return (list(trees),
+            torch.from_numpy(np.asarray(targets, dtype=np.float32)),
+            torch.tensor(weights, dtype=torch.float32))
+
 class BaoRegression:
-    def __init__(self, verbose=False, have_cache_data=False, alpha=0.25, contrastive=False, meta=False, lr=0.001):
+    def __init__(self, verbose=False, have_cache_data=False, alpha=0.25, contrastive=False, meta=False, lr=0.001,
+                 template_contrastive=False):
         self.__net = None
         self.__verbose = verbose
         self.__alpha = alpha
         self.__contrastive=contrastive
         self.__meta = meta
-        self.__lr = 0.001
+        self.__template_contrastive = template_contrastive
+        self.__lr = lr
 
         log_transformer = preprocessing.FunctionTransformer(
             np.log1p, _inv_log1p,
@@ -118,6 +184,8 @@ class BaoRegression:
             path += "_contrastive"
         if self.__meta is True:
             path += "_meta"
+        if self.__template_contrastive:
+            path += "_template"
         path += "_{}_{}_{}".format(self.__alpha, self.__lr, repeat)
         print("Load model from {}".format(path))
 
@@ -127,7 +195,8 @@ class BaoRegression:
             self.__in_channels = joblib.load(f)
             
         self.__net = net.BaoNet(self.__in_channels)
-        self.__net.load_state_dict(torch.load(_nn_path(path)))
+        self.__net.load_state_dict(torch.load(
+            _nn_path(path), map_location="cuda" if CUDA else "cpu"))
         self.__net.eval()
         
         with open(_y_transform_path(path), "rb") as f:
@@ -141,6 +210,8 @@ class BaoRegression:
             path += "_contrastive"
         if self.__meta is True:
             path += "_meta"
+        if self.__template_contrastive:
+            path += "_template"
         path += "_{}_{}_{}".format(self.__alpha, self.__lr, repeat)
         os.makedirs(path, exist_ok=True)
         print("Save model to {}".format(path))
@@ -155,7 +226,8 @@ class BaoRegression:
         with open(_n_path(path), "wb") as f:
             joblib.dump(self.__n, f)
 
-    def fit(self, X, y, train_num=10):
+    def fit(self, X, y, train_num=10, epochs=100, batch_size=256, seed=0,
+            template_labels=None, sample_weights=None, warm_start=False):
         if isinstance(y, list):
             y = np.array(y)
 
@@ -165,9 +237,13 @@ class BaoRegression:
         # transform the set of trees into feature vectors using a log
         # (assuming the tail behavior exists, TODO investigate
         #  the quantile transformer from scikit)
-        y = self.__pipeline.fit_transform(y.reshape(-1, 1)).astype(np.float32)
-        
-        self.__tree_transform.fit(X)
+        if warm_start:
+            if self.__net is None:
+                raise ValueError("warm_start requires a loaded Bao model")
+            y = self.__pipeline.transform(y.reshape(-1, 1)).astype(np.float32)
+        else:
+            y = self.__pipeline.fit_transform(y.reshape(-1, 1)).astype(np.float32)
+            self.__tree_transform.fit(X)
         X = self.__tree_transform.transform(X)
 
         X_train = X[:train_num]
@@ -176,17 +252,35 @@ class BaoRegression:
         y_test = y[train_num:]
         print(len(X_train), len(X_test))
 
-        pairs = list(zip(X_train, y_train))
+        if sample_weights is not None:
+            if len(sample_weights) != len(X):
+                raise ValueError("Sample weights must align with all examples")
+            pairs = list(zip(X_train, y_train, sample_weights[:train_num]))
+        elif self.__template_contrastive:
+            if template_labels is None or len(template_labels) != len(X):
+                raise ValueError("Template labels must align with all training examples")
+            pairs = list(zip(X_train, y_train, template_labels[:train_num]))
+        else:
+            pairs = list(zip(X_train, y_train))
+        generator = torch.Generator()
+        generator.manual_seed(seed)
         dataset = DataLoader(pairs,
-                             batch_size=256,
+                             batch_size=batch_size,
                              shuffle=True,
-                             collate_fn=collate)
+                             collate_fn=(collate_weighted if sample_weights is not None
+                                         else collate_template if self.__template_contrastive
+                                         else collate),
+                             generator=generator)
         
         test_pairs = list(zip(X_test, y_test))
-        test_dataset = DataLoader(test_pairs, batch_size=256, shuffle=True, collate_fn=collate)
+        test_generator = torch.Generator()
+        test_generator.manual_seed(seed + 1)
+        test_dataset = DataLoader(test_pairs, batch_size=batch_size, shuffle=True,
+                                  collate_fn=collate, generator=test_generator)
 
         # determine the initial number of channels
-        for inp, _tar in dataset:
+        for initial_batch in dataset:
+            inp = initial_batch[0]
             in_channels = inp[0][0].shape[0]
             break
 
@@ -197,21 +291,41 @@ class BaoRegression:
         else:
             assert in_channels == self.__tree_transform.num_operators() + 2
 
-        self.__net = net.BaoNet(in_channels)
-        self.__in_channels = in_channels
-        if CUDA:
-            self.__net = self.__net.cuda()
+        if warm_start:
+            if in_channels != self.__in_channels:
+                raise ValueError(
+                    "Warm-start feature width changed: {} != {}".format(
+                        in_channels, self.__in_channels))
+            self.__net.train()
+        else:
+            self.__net = net.BaoNet(in_channels)
+            self.__in_channels = in_channels
+            if CUDA:
+                self.__net = self.__net.cuda()
 
         optimizer = torch.optim.Adam(self.__net.parameters(), lr=self.__lr)
         loss_fn = torch.nn.MSELoss(reduction='none')
         
         losses = []
-        for epoch in range(100):
-            loss_accum = 0
-            for x, y in dataset:
+        for epoch in range(epochs):
+            loss_accum = torch.zeros((), device="cuda" if CUDA else "cpu")
+            for batch in dataset:
+                if sample_weights is not None:
+                    x, y, batch_weights = batch
+                elif self.__template_contrastive:
+                    x, y, batch_template_labels = batch
+                else:
+                    x, y = batch
                 if CUDA:
                     y = y.cuda()
-                w = 1 / len(x)
+                    if sample_weights is not None:
+                        batch_weights = batch_weights.cuda()
+                    if self.__template_contrastive:
+                        batch_template_labels = batch_template_labels.cuda()
+                if sample_weights is not None:
+                    w = batch_weights / batch_weights.sum()
+                else:
+                    w = 1 / len(x)
                 if self.__meta is True:
                     interval = 0
                 else:
@@ -235,24 +349,31 @@ class BaoRegression:
                     
                     w_tilde = torch.clamp(-grad_eps, min=0)
                     norm_c = torch.sum(w_tilde)
-                    if norm_c != 0:
-                        w = w_tilde / norm_c
-                    else:
-                        w = w_tilde
+                    # w_tilde is nonnegative; clamping only changes the zero
+                    # denominator case, where the original branch also
+                    # returned the all-zero vector.
+                    w = w_tilde / norm_c.clamp_min(torch.finfo(w_tilde.dtype).eps)
                 y_feature, y_pred = self.__net(x)
-                contrastive_loss = ranking_loss(y_feature, y, y_pred)
                 est_loss = loss_fn(y_pred, y)
-                if self.__contrastive is True:
-                    loss = torch.sum(self.__alpha * w * contrastive_loss + (1 - self.__alpha) * w * est_loss)
+                if sample_weights is not None:
+                    loss = torch.sum(w * est_loss.squeeze(1))
+                elif self.__template_contrastive:
+                    contrastive_loss = template_contrastive_loss(
+                        y_feature, batch_template_labels)
+                    loss = torch.sum(self.__alpha * w * contrastive_loss + (1 - self.__alpha) * w * est_loss.squeeze(1))
+                elif self.__contrastive is True:
+                    contrastive_loss = ranking_loss(y_feature, y, y_pred)
+                    loss = _broadcast_weighted_objective(
+                        w, contrastive_loss, est_loss, self.__alpha)
                 else:
                     loss = torch.sum(w * est_loss)
-                loss_accum += loss.item()
+                loss_accum = loss_accum + loss.detach()
         
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-            loss_accum /= len(dataset)
+            loss_accum = (loss_accum / len(dataset)).item()
             losses.append(loss_accum)
             if epoch % 5 == 0:
                 self.__log("Epoch", epoch, "training loss:", loss_accum)
@@ -274,6 +395,17 @@ class BaoRegression:
         X = self.__tree_transform.transform(X)
         
         self.__net.eval()
-        pred = self.__net(X)[1].cpu().detach().numpy()
+        with torch.inference_mode():
+            pred = self.__net(X)[1].cpu().numpy()
         return self.__pipeline.inverse_transform(pred)
 
+    def representation_features(self, X):
+        """Return the learned Bao representation used for CBP clustering."""
+        if not isinstance(X, list):
+            X = [X]
+        X = [json.loads(x) if isinstance(x, str) else x for x in X]
+        transformed = self.__tree_transform.transform(X)
+        self.__net.eval()
+        with torch.no_grad():
+            features, _ = self.__net(transformed)
+        return features.cpu().numpy()

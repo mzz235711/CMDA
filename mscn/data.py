@@ -53,7 +53,7 @@ def load_samples(file_name, num_queries, num_materialized_samples):
         samples = [[]] * num_queries
     return samples
 
-def load_query(csv_file, templates={}, query_num=0, contain_labels=True):
+def load_query(csv_file, templates={}, query_num=0, contain_labels=True, indices=None):
     tables = []
     joins = []
     predicates = []
@@ -64,11 +64,14 @@ def load_query(csv_file, templates={}, query_num=0, contain_labels=True):
     template_distribution = {t:0 for t in templates}
     template_labels = []
     query_labels = []
+    selected_indices = None if indices is None else set(indices)
     with open (csv_file) as f:
         data_raw = list(list(rec) for rec in csv.reader(f, delimiter='#'))
         for i, row in enumerate(data_raw):
             if query_num > 0 and i >= query_num:
                 break
+            if selected_indices is not None and i not in selected_indices:
+                continue
             table = row[0].split(',')
             join = row[1].split(',')
             predicate = row[2].split(',')
@@ -152,7 +155,9 @@ def load_query(csv_file, templates={}, query_num=0, contain_labels=True):
             #q_cols.append(full_col)
             #q_ops.append(op)
             #q_vals.append(val)
-            template_predicates.append(col)
+            # A query template removes predicate constants while retaining
+            # predicate columns and operators.
+            template_predicates.append(col + op)
             q_predicates.append([col, op, val])
         template_predicates.sort()
         q_template = ','.join(t_fullname) + '#' + ','.join(q_joins) + '#' + ','.join(template_predicates)
@@ -321,12 +326,21 @@ def encode_data_from_saver(query_file, sample_bitmap_file, table2vec, join2vec, 
 
 
 '''Currently used'''
-def templatize_and_encode_data(query_file, sample_bitmaps_file, adaptation_query_file, adaptation_sample_bitmaps_file, min_max_file, num_samples=0, repeat=10):
+def templatize_and_encode_data(query_file, sample_bitmaps_file, adaptation_query_file, adaptation_sample_bitmaps_file, min_max_file, num_samples=0, repeat=10, adaptation_indices=None):
     # Read and analyze queries and templates from file.
     templates, template_distribution, source_tables, source_joins, source_predicates, source_query_labels, source_template_labels = load_query(query_file)
     source_samples = load_samples(sample_bitmaps_file, len(source_tables), num_materialized_samples=num_samples)
-    templates, template_distribution, target_tables, target_joins, target_predicates, target_query_labels, target_template_labels = load_query(adaptation_query_file, templates=templates)
-    adaptation_samples = load_samples(adaptation_sample_bitmaps_file, len(target_tables), num_materialized_samples=num_samples)
+    templates, template_distribution, target_tables, target_joins, target_predicates, target_query_labels, target_template_labels = load_query(
+        adaptation_query_file, templates=templates, indices=adaptation_indices)
+    if adaptation_indices is None:
+        adaptation_samples = load_samples(adaptation_sample_bitmaps_file, len(target_tables), num_materialized_samples=num_samples)
+    else:
+        with open(adaptation_query_file) as adaptation_query_stream:
+            adaptation_pool_size = sum(1 for _ in adaptation_query_stream)
+        adaptation_pool_samples = load_samples(
+            adaptation_sample_bitmaps_file, adaptation_pool_size,
+            num_materialized_samples=num_samples)
+        adaptation_samples = [adaptation_pool_samples[i] for i in sorted(adaptation_indices)]
     print("Finish load training queries.")
     #columns = predicates[0]
     #operators = predicates[1]
@@ -378,7 +392,11 @@ def templatize_and_encode_data(query_file, sample_bitmaps_file, adaptation_query
         for i, row in enumerate(data_raw):
             if i == 0:
                 continue
-            all_table_names.append(row[0])
+            # Workload metadata may store either a bare table name (the
+            # original CMDA files) or "table alias" (ResCard JOB/DSB). Query
+            # parsing uses the alias in the latter case, so build matching
+            # one-hot keys without changing either workload representation.
+            all_table_names.append(row[0].split()[-1])
     table2vec, idx2table = get_set_encoding(all_table_names)
     
     all_join_names = []
@@ -1305,11 +1323,15 @@ def get_generated_source_target_datasets(train_query_file, adaptation_query_file
            anchor_test_tensors, positive_test_tensors, negative_test_tensors, validation_labels, valid_positive_labels, source_labels_test, validation_template_labels, valid_positive_template_labels, source_template_labels_test, train_indices, test_indices, train_large_difference, test_large_difference 
 
 '''Currently used'''
-def get_triplet_train_datasets(train_query_file, train_bitmap_file, adaptation_query_file, adaptation_bitmap_file, min_max_file, num_samples=0, repeat=10):
+def get_triplet_train_datasets(train_query_file, train_bitmap_file, adaptation_query_file, adaptation_bitmap_file, min_max_file, num_samples=0, repeat=10, adaptation_indices=None):
     #dicts, idxdicts, column_min_max_vals, min_val, max_val, labels_train, labels_test, max_num_joins, max_num_cols, max_num_opvals, train_data, \
     #            test_data, templates, template_distribution, template_labels_train, template_labels_test = templatize_and_encode_data(train_query_file, train_bitmap_file, min_max_file, num_samples=num_samples)
     dicts, idxdicts, column_min_max_vals, min_val, max_val, labels_train, labels_test, max_num_joins, max_num_predicates, train_data, \
-                test_data, templates, template_distribution, template_labels_train, template_labels_test = templatize_and_encode_data(train_query_file, train_bitmap_file,  adaptation_query_file, adaptation_bitmap_file, min_max_file, num_samples=num_samples, repeat=repeat)
+                test_data, templates, template_distribution, template_labels_train, template_labels_test = templatize_and_encode_data(
+                    train_query_file, train_bitmap_file, adaptation_query_file,
+                    adaptation_bitmap_file, min_max_file,
+                    num_samples=num_samples, repeat=repeat,
+                    adaptation_indices=adaptation_indices)
     #train_tensors = make_tensors(train_data, max_num_joins, max_num_cols, max_num_opvals)
     #test_tensors = make_tensors(test_data, max_num_joins, max_num_cols, max_num_opvals)
     train_tensors = make_tensors(train_data, max_num_joins, max_num_predicates)

@@ -55,10 +55,16 @@ class BaoModel:
         res = self.__current_model.predict(plans)
         return res[0][0]
     
-    def load_model(self, fp):
+    def load_model(self, fp, options=None):
         try:
-            new_model = model.BaoRegression(have_cache_data=True)
-            new_model.load(fp)
+            options = options or {}
+            new_model = model.BaoRegression(
+                have_cache_data=True,
+                alpha=float(options.get("alpha", 0.25)),
+                lr=float(options.get("lr", 0.001)),
+                contrastive=bool(options.get("contrastive", False)),
+                meta=bool(options.get("meta", False)))
+            new_model.load(fp, int(options.get("repeat", 1)))
 
             if reg_blocker.should_replace_model(
                     self.__current_model,
@@ -117,8 +123,8 @@ class BaoJSONHandler(JSONTCPHandler):
                 plan = add_buffer_info_to_plans(buffers, [plan])[0]
                 storage.record_reward(plan, obs_reward["reward"], obs_reward["pid"])
             elif message_type == "load model":
-                path = self.__messages[0]["path"]
-                self.server.bao_model.load_model(path)
+                request = self.__messages[0]
+                self.server.bao_model.load_model(request["path"], request)
             else:
                 print("Unknown message type:", message_type)
             

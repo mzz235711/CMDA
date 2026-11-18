@@ -6,7 +6,9 @@ import torch.nn.functional as F
 # Define model architecture
 
 class SetConv(nn.Module):
-    def __init__(self, sample_feats=10, col_feats=10, opval_feats=10, join_feats=10, hid_units=256):
+    def __init__(self, sample_feats=10, col_feats=10, opval_feats=10,
+                 join_feats=10, hid_units=256, robust=False,
+                 dropout_rate=0.2):
         super(SetConv, self).__init__()
         print("JOINS_FEATS: ", join_feats)
         print("COL_FEATS: ", col_feats)
@@ -26,6 +28,13 @@ class SetConv(nn.Module):
         self.part_mlp2 = nn.Linear(hid_units, hid_units)
         self.out_mlp1 = nn.Linear(hid_units, hid_units)
         self.out_mlp2 = nn.Linear(hid_units, 1)
+        # Robust-MSCN masks input and hidden features during training. Dropout
+        # is disabled automatically by model.eval(), so prediction uses the
+        # complete query representation.
+        self.robust = robust
+        self.input_dropout = nn.Dropout(p=dropout_rate)
+        self.hidden_dropout = nn.Dropout(p=dropout_rate)
+        self.combined_dropout = nn.Dropout(p=dropout_rate)
 
     #def forward(self, samples, cols, opvals, joins, sample_mask, col_mask, opval_mask, join_mask):
     def forward(self, samples, predicates, joins, sample_mask, predicate_mask, join_mask):
@@ -33,15 +42,28 @@ class SetConv(nn.Module):
         # predicates has shape [batch_size x num_predicates x predicate_feats]
         # joins has shape [batch_size x num_joins x join_feats]
 
+        if self.robust:
+            samples = self.input_dropout(samples)
+            predicates = self.input_dropout(predicates)
+            joins = self.input_dropout(joins)
+
         hid_sample = F.relu(self.sample_mlp1(samples))
+        if self.robust:
+            hid_sample = self.hidden_dropout(hid_sample)
         hid_sample = F.relu(self.sample_mlp2(hid_sample))
+        if self.robust:
+            hid_sample = self.hidden_dropout(hid_sample)
         hid_sample = hid_sample * sample_mask  # Mask
         hid_sample = torch.sum(hid_sample, dim=1, keepdim=False)
         sample_norm = sample_mask.sum(1, keepdim=False)
         hid_sample = hid_sample / sample_norm  # Calculate average only over non-masked parts
 
         hid_predicate = F.relu(self.predicate_mlp1(predicates))
+        if self.robust:
+            hid_predicate = self.hidden_dropout(hid_predicate)
         hid_predicate = F.relu(self.predicate_mlp2(hid_predicate))
+        if self.robust:
+            hid_predicate = self.hidden_dropout(hid_predicate)
         hid_predicate = hid_predicate * predicate_mask
         hid_predicate = torch.sum(hid_predicate, dim=1, keepdim=False)
         predicate_norm = predicate_mask.sum(1, keepdim=False)
@@ -64,7 +86,11 @@ class SetConv(nn.Module):
         '''
 
         hid_join = F.relu(self.join_mlp1(joins))
+        if self.robust:
+            hid_join = self.hidden_dropout(hid_join)
         hid_join = F.relu(self.join_mlp2(hid_join))
+        if self.robust:
+            hid_join = self.hidden_dropout(hid_join)
         hid_join = hid_join * join_mask
         hid_join = torch.sum(hid_join, dim=1, keepdim=False)
         join_norm = join_mask.sum(1, keepdim=False)
@@ -72,6 +98,8 @@ class SetConv(nn.Module):
 
         #hid = torch.cat((hid_sample, hid_col, hid_opval, hid_join), 1)
         hid = torch.cat((hid_sample, hid_predicate, hid_join), 1)
+        if self.robust:
+            hid = self.combined_dropout(hid)
         feature = F.relu(self.part_mlp1(hid))
         #hid_opval = F.relu(self.part_mlp2(hid_opval))
         #hid = torch.cat((feature, hid_opval), 1)

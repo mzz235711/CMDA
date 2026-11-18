@@ -1,0 +1,9 @@
+numpy<2
+scipy
+pandas
+scikit-learn
+joblib
+torch>=2.0,<3
+higher==0.2.1
+psycopg2-binary
+matplotlib

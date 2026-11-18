@@ -32,7 +32,7 @@
 
 // Connect to a Bao server, construct plans for each arm, have the server
 // select a plan. Has the same signature as the PG optimizer.
-BaoPlan *plan_query(Query *parse, int cursorOptions, ParamListInfo boundParams);
+BaoPlan *plan_query(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams);
 
 // Translate an arm index into SQL statements to give the hint (used for EXPLAIN).
 char* arm_to_hint(int arm);
@@ -210,6 +210,7 @@ static void set_arm_options(int arm) {
 
 // Get a query plan for a particular arm.
 static PlannedStmt* plan_arm(int arm, Query* parse,
+                             const char *query_string,
                              int cursorOptions, ParamListInfo boundParams) {
 
   PlannedStmt* plan = NULL;
@@ -217,7 +218,7 @@ static PlannedStmt* plan_arm(int arm, Query* parse,
 
   if (arm == -1) {
     // Use whatever the user has set as the current configuration.
-    plan = standard_planner(query_copy, cursorOptions, boundParams);
+    plan = standard_planner(query_copy, query_string, cursorOptions, boundParams);
     return plan;
   }
   
@@ -225,7 +226,7 @@ static PlannedStmt* plan_arm(int arm, Query* parse,
   // and invoke the PG planner.
   save_arm_options({
       set_arm_options(arm);
-      plan = standard_planner(query_copy, cursorOptions, boundParams);
+      plan = standard_planner(query_copy, query_string, cursorOptions, boundParams);
     });
 
   return plan;
@@ -353,7 +354,7 @@ static char* plan_to_json(PlannedStmt* plan) {
 // Primary planning function. Invokes the PG planner for each arm, sends the
 // results to the Bao server, gets the response, and returns the corrosponding
 // query plan (as a BaoPlan).
-BaoPlan* plan_query(Query *parse, int cursorOptions, ParamListInfo boundParams) {
+BaoPlan* plan_query(Query *parse, const char *query_string, int cursorOptions, ParamListInfo boundParams) {
   BaoPlan* plan;
   PlannedStmt* plan_for_arm[BAO_MAX_ARMS];
   char* json_for_arm[BAO_MAX_ARMS];
@@ -373,7 +374,7 @@ BaoPlan* plan_query(Query *parse, int cursorOptions, ParamListInfo boundParams) 
     // default PostgreSQL plan. Note that we do *not* use arm 0, as
     // this would ignore the user's settings for things like
     // enable_nestloop.
-    plan->plan = plan_arm(-1, parse, cursorOptions, boundParams);
+    plan->plan = plan_arm(-1, parse, query_string, cursorOptions, boundParams);
     plan->query_info->plan_json = plan_to_json(plan->plan);
     return plan;
   }
@@ -390,7 +391,7 @@ BaoPlan* plan_query(Query *parse, int cursorOptions, ParamListInfo boundParams) 
   for (int i = 0; i < bao_num_arms; i++) {
     // Plan the query for this arm.
     query_copy = copyObject(parse);
-    plan_for_arm[i] = plan_arm(i, query_copy, cursorOptions, boundParams);
+    plan_for_arm[i] = plan_arm(i, query_copy, query_string, cursorOptions, boundParams);
 
     // Transform it into JSON, transmit it to the Bao server.
     json_for_arm[i] = plan_to_json(plan_for_arm[i]);
